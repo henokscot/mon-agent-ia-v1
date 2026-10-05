@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mon Agent IA</title>
+<style>
+  :root { --fond:#F6F4EF; --encre:#1B2A2F; --accent:#0F6B5C; --bulle:#FFFFFF; --ligne:#DAD6CB; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: Georgia, "Times New Roman", serif; background: var(--fond); color: var(--encre);
+         display: flex; flex-direction: column; max-width: 720px; margin: 0 auto; }
+  header { padding: 16px 20px; border-bottom: 1px solid var(--ligne); }
+  header h1 { margin: 0; font-size: 1.25rem; }
+  header p { margin: 2px 0 0; font-size: .9rem; opacity: .7; }
+  #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 14px; line-height: 1.5; white-space: pre-wrap; }
+  .moi { align-self: flex-end; background: var(--accent); color: #fff; }
+  .ia { align-self: flex-start; background: var(--bulle); border: 1px solid var(--ligne); }
+  form { display: flex; gap: 8px; padding: 12px 20px 16px; border-top: 1px solid var(--ligne); }
+  input { flex: 1; font: inherit; padding: 12px 14px; border: 1px solid var(--ligne); border-radius: 10px; background: #fff; }
+  button { font: inherit; padding: 12px 18px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: wait; }
+  input:focus-visible, button:focus-visible { outline: 3px solid #E0A82E; outline-offset: 2px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Mon Agent IA</h1>
+    <p>Pose-moi ta question, je réponds en français.</p>
+  </header>
+  <div id="chat">
+    <div class="msg ia">Bonjour ! Comment puis-je t'aider aujourd'hui ?</div>
+  </div>
+  <form id="form">
+    <input id="saisie" placeholder="Écris ton message…" autocomplete="off" required>
+    <button id="envoyer" type="submit">Envoyer</button>
+  </form>
+
+<script>
+  const chat = document.getElementById("chat");
+  const form = document.getElementById("form");
+  const saisie = document.getElementById("saisie");
+  const bouton = document.getElementById("envoyer");
+  const historique = []; // mémoire de la conversation
+
+  function ajouter(texte, classe) {
+    const d = document.createElement("div");
+    d.className = "msg " + classe;
+    d.textContent = texte;
+    chat.appendChild(d);
+    chat.scrollTop = chat.scrollHeight;
+    return d;
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const texte = saisie.value.trim();
+    if (!texte) return;
+    saisie.value = "";
+    ajouter(texte, "moi");
+    historique.push({ role: "user", content: texte });
+    bouton.disabled = true;
+    const attente = ajouter("…", "ia");
+
+    try {
+      const r = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: historique }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Erreur");
+      attente.textContent = data.reply;
+      historique.push({ role: "assistant", content: data.reply });
+    } catch (err) {
+      attente.textContent = "Erreur : " + err.message + ". Réessaie dans un instant.";
+      historique.pop(); // retire le message qui a échoué
+    }
+    bouton.disabled = false;
+    saisie.focus();
+  });
+</script>
+</body>
+</html>
