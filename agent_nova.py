@@ -10,8 +10,8 @@ Fusion de trois briques en un seul fichier à lancer :
 Deux modes d'utilisation du MÊME fichier :
 
   A) Interface web (par défaut) :
-       pip install flask anthropic openai google-generativeai pycryptodome
-       export NOVA_API_PROVIDER="anthropic"  # ou "openai", "google", "custom"
+       pip install flask anthropic openai google-generativeai pycryptodome tenacity
+       export NOVA_API_PROVIDER="anthropic"  # ou "openai", "google", "mistral", "groq", "ollama", "custom"
        export NOVA_API_KEY="ta_clé_api"
        # Optionnel: export NOVA_API_BASE="https://api.custom.com/v1" (pour endpoints compatibles OpenAI)
        # Optionnel: export NOVA_MODEL="claude-3-5-sonnet-20241022" (modèle spécifique)
@@ -43,14 +43,19 @@ import ast
 import getpass
 import hashlib
 import json
+import logging
 import os
 import secrets
+import sqlite3
 import sys
 import threading
+import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Generator, Iterable, Optional
 
 # =============================================================================
 # CONFIGURATION MULTI-FOURNISSEURS
@@ -66,6 +71,7 @@ class ProviderConfig:
     default_model: str = ""
     default_base: str | None = None
     requires_base: bool = False
+    supports_streaming: bool = True
 
 
 PROVIDERS: dict[str, ProviderConfig] = {
@@ -75,6 +81,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         env_base="ANTHROPIC_API_BASE",
         env_model="ANTHROPIC_MODEL",
         default_model="claude-3-5-sonnet-20241022",
+        supports_streaming=True,
     ),
     "openai": ProviderConfig(
         name="OpenAI",
@@ -83,6 +90,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         env_model="OPENAI_MODEL",
         default_model="gpt-4o",
         default_base="https://api.openai.com/v1",
+        supports_streaming=True,
     ),
     "google": ProviderConfig(
         name="Google (Gemini)",
@@ -90,6 +98,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         env_base="GOOGLE_API_BASE",
         env_model="GOOGLE_MODEL",
         default_model="gemini-1.5-pro",
+        supports_streaming=False,  # Gemini streaming function calling plus complexe
     ),
     "mistral": ProviderConfig(
         name="Mistral AI",
@@ -98,6 +107,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         env_model="MISTRAL_MODEL",
         default_model="mistral-large-latest",
         default_base="https://api.mistral.ai/v1",
+        supports_streaming=True,
     ),
     "groq": ProviderConfig(
         name="Groq",
@@ -106,15 +116,17 @@ PROVIDERS: dict[str, ProviderConfig] = {
         env_model="GROQ_MODEL",
         default_model="llama-3.3-70b-versatile",
         default_base="https://api.groq.com/openai/v1",
+        supports_streaming=True,
     ),
     "ollama": ProviderConfig(
         name="Ollama (local)",
-        env_key="OLLAMA_API_KEY",  # usually not required
+        env_key="OLLAMA_API_KEY",
         env_base="OLLAMA_API_BASE",
         env_model="OLLAMA_MODEL",
         default_model="llama3.1",
         default_base="http://localhost:11434/v1",
         requires_base=False,
+        supports_streaming=True,
     ),
     "custom": ProviderConfig(
         name="Custom (OpenAI-compatible)",
@@ -124,10 +136,10 @@ PROVIDERS: dict[str, ProviderConfig] = {
         default_model="",
         default_base="",
         requires_base=True,
+        supports_streaming=True,
     ),
 }
 
-# Configuration unifiée via variables d'environnement NOVA_*
 NOVA_PROVIDER = os.environ.get("NOVA_API_PROVIDER", "anthropic").lower()
 NOVA_API_KEY = os.environ.get("NOVA_API_KEY")
 NOVA_API_BASE = os.environ.get("NOVA_API_BASE")
@@ -135,41 +147,159 @@ NOVA_MODEL = os.environ.get("NOVA_MODEL")
 
 
 def get_active_provider() -> ProviderConfig:
-    """Retourne la configuration du fournisseur actif."""
     if NOVA_PROVIDER in PROVIDERS:
         return PROVIDERS[NOVA_PROVIDER]
     return PROVIDERS["custom"]
 
 
 def resolve_config() -> tuple[str, str | None, str]:
-    """
-    Résout la configuration finale (clé API, base URL, modèle) en fusionnant :
-    1. Variables NOVA_* (priorité haute, universelles)
-    2. Variables spécifiques au fournisseur (ex: ANTHROPIC_API_KEY)
-    3. Valeurs par défaut du fournisseur
-    """
     provider = get_active_provider()
-
-    # Clé API
     api_key = NOVA_API_KEY or os.environ.get(provider.env_key)
     if not api_key and provider.name != "Ollama (local)":
         raise RuntimeError(
             f"Clé API manquante. Définis {provider.env_key} ou NOVA_API_KEY.\n"
             f"Fournisseur actuel : {provider.name} ({NOVA_PROVIDER})"
         )
-
-    # Base URL
     base_url = NOVA_API_BASE or os.environ.get(provider.env_base) or provider.default_base
-
-    # Modèle
     model = NOVA_MODEL or os.environ.get(provider.env_model) or provider.default_model
     if not model:
         raise RuntimeError(
             f"Modèle non défini. Définis {provider.env_model} ou NOVA_MODEL, "
             f"ou choisis un fournisseur avec un modèle par défaut."
         )
-
     return api_key, base_url, model
+
+
+# =============================================================================
+# LOGGING STRUCTURÉ
+# =============================================================================
+
+def setup_logging(level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger("nova")
+    logger.setLevel(getattr(logging, level.upper()))
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%H:%M:%S"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+
+log = setup_logging(os.environ.get("NOVA_LOG_LEVEL", "INFO"))
+
+
+# =============================================================================
+# PERSISTANCE SQLITE (HISTORIQUE CONVERSATIONS)
+# =============================================================================
+
+DB_PATH = Path(os.environ.get("NOVA_DB_PATH", "/workspace/app/nova.db"))
+DB_LOCK = threading.Lock()
+
+
+@contextmanager
+def get_db() -> Generator[sqlite3.Connection, None, None]:
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tool_calls TEXT,
+                tool_results TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_created
+            ON conversations(session_id, created_at)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                provider TEXT,
+                model TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+
+def save_message(
+    session_id: str,
+    role: str,
+    content: str,
+    tool_calls: list[dict] | None = None,
+    tool_results: list[dict] | None = None
+) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO conversations (session_id, role, content, tool_calls, tool_results)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                role,
+                content,
+                json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None,
+                json.dumps(tool_results, ensure_ascii=False) if tool_results else None,
+            )
+        )
+        conn.execute(
+            """INSERT OR REPLACE INTO sessions (id, updated_at) VALUES (?, ?)""",
+            (session_id, datetime.now().isoformat())
+        )
+
+
+def load_session(session_id: str) -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT role, content, tool_calls, tool_results FROM conversations "
+            "WHERE session_id = ? ORDER BY created_at",
+            (session_id,)
+        ).fetchall()
+    messages = []
+    for row in rows:
+        msg = {"role": row["role"], "content": row["content"]}
+        if row["tool_calls"]:
+            msg["tool_calls"] = json.loads(row["tool_calls"])
+        if row["tool_results"]:
+            msg["tool_results"] = json.loads(row["tool_results"])
+        messages.append(msg)
+    return messages
+
+
+def list_sessions(limit: int = 50) -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, title, provider, model, created_at, updated_at FROM sessions "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_session(session_id: str) -> None:
+    with get_db() as conn:
+        conn.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
 
 
 # =============================================================================
@@ -201,7 +331,6 @@ SUSPICIOUS_CALLS = {
 
 
 def derive_key(password: str, salt: bytes) -> bytes:
-    """Dérive une clé AES-256 depuis un mot de passe avec PBKDF2-HMAC-SHA256."""
     if not password:
         raise ValueError("Le mot de passe ne peut pas être vide.")
     return hashlib.pbkdf2_hmac(
@@ -220,7 +349,6 @@ def _require_aes():
 
 
 def encrypt_file(source: Path, destination: Path, password: str) -> Path:
-    """Chiffre un fichier avec AES-256-GCM et vérification d'intégrité."""
     AES = _require_aes()
     if not source.is_file():
         raise FileNotFoundError(f"Fichier introuvable : {source}")
@@ -241,7 +369,6 @@ def encrypt_file(source: Path, destination: Path, password: str) -> Path:
 
 
 def decrypt_file(source: Path, destination: Path, password: str) -> Path:
-    """Déchiffre un fichier NOVASAFE2 et refuse toute donnée altérée."""
     AES = _require_aes()
     if not source.is_file():
         raise FileNotFoundError(f"Fichier introuvable : {source}")
@@ -278,7 +405,6 @@ def _iter_files(root: Path) -> Iterable[Path]:
 
 
 def encrypt_tree(source: Path, destination: Path, password: str, suffix: str = ".nsafe") -> list[Path]:
-    """Chiffre récursivement un fichier ou un dossier entier."""
     outputs: list[Path] = []
     if source.is_file():
         out = destination if destination.suffix else destination / (source.name + suffix)
@@ -292,7 +418,6 @@ def encrypt_tree(source: Path, destination: Path, password: str, suffix: str = "
 
 
 def decrypt_tree(source: Path, destination: Path, password: str, suffix: str = ".nsafe") -> list[Path]:
-    """Déchiffre récursivement un fichier ou un dossier entier."""
     outputs: list[Path] = []
     if source.is_file():
         name = source.name[:-len(suffix)] if source.name.endswith(suffix) else source.name + ".dec"
@@ -310,7 +435,6 @@ def decrypt_tree(source: Path, destination: Path, password: str, suffix: str = "
 
 
 def _dotted_name(node: ast.AST) -> str | None:
-    """Reconstruit 'a.b.c' pour un Attribute/Name chaîné, sinon None."""
     parts: list[str] = []
     while isinstance(node, ast.Attribute):
         parts.append(node.attr)
@@ -322,7 +446,6 @@ def _dotted_name(node: ast.AST) -> str | None:
 
 
 def analyze_python_file(path: Path, max_line_length: int = 100) -> dict[str, Any]:
-    """Analyse la syntaxe, la qualité et les signaux de sécurité, sans exécuter le fichier."""
     if not path.is_file():
         raise FileNotFoundError(f"Fichier introuvable : {path}")
 
@@ -390,7 +513,6 @@ def analyze_python_file(path: Path, max_line_length: int = 100) -> dict[str, Any
 
 
 def scan_directory(root: Path, max_line_length: int = 100) -> dict[str, Any]:
-    """Audite tous les fichiers .py d'un dossier et agrège les résultats."""
     if not root.is_dir():
         raise NotADirectoryError(f"Dossier introuvable : {root}")
 
@@ -413,7 +535,6 @@ def scan_directory(root: Path, max_line_length: int = 100) -> dict[str, Any]:
 
 
 def create_project(destination: Path, name: str | None = None) -> Path:
-    """Crée un squelette de projet Python propre, sans lancement automatique."""
     destination.mkdir(parents=True, exist_ok=True)
     project_name = name or destination.name
 
@@ -454,7 +575,7 @@ def create_project(destination: Path, name: str | None = None) -> Path:
 
 
 # =============================================================================
-# PARTIE 2 : AGENT IA — ABSTRACTION MULTI-FOURNISSEURS
+# PARTIE 2 : AGENT IA — ABSTRACTION MULTI-FOURNISSEURS AVEC RETRY/STREAMING
 # =============================================================================
 
 SYSTEM_PROMPT = (
@@ -515,8 +636,6 @@ TOOLS = [
 
 
 class LLMClient(ABC):
-    """Interface commune pour tous les fournisseurs LLM."""
-
     @abstractmethod
     def create_message(
         self,
@@ -525,22 +644,34 @@ class LLMClient(ABC):
         system: str,
         tools: list[dict],
         messages: list[dict],
+        stream: bool = False,
     ) -> Any:
-        """Envoie une requête et retourne la réponse brute du fournisseur."""
         pass
 
     @abstractmethod
     def extract_content(self, response: Any) -> tuple[list[str], list[dict]]:
-        """
-        Extrait le texte et les tool_use de la réponse.
-        Retourne (text_blocks, tool_uses).
-        """
         pass
 
     @abstractmethod
     def format_tool_results(self, tool_results: list[dict]) -> list[dict]:
-        """Formate les résultats d'outils pour le fournisseur."""
         pass
+
+    @abstractmethod
+    def stream_response(self, response: Any) -> Generator[str, None, None]:
+        """Générateur pour streaming token par token."""
+        pass
+
+
+# Retry decorator
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    HAS_TENACITY = True
+except ImportError:
+    HAS_TENACITY = False
+    def retry(*args, **kwargs):
+        def decorator(f):
+            return f
+        return decorator
 
 
 class AnthropicClient(LLMClient):
@@ -548,44 +679,71 @@ class AnthropicClient(LLMClient):
         import anthropic
         self.client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
 
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type(Exception),
+    ) if HAS_TENACITY else lambda f: f
     def create_message(self, model: str, max_tokens: int, system: str,
-                       tools: list[dict], messages: list[dict]) -> Any:
+                       tools: list[dict], messages: list[dict], stream: bool = False) -> Any:
         return self.client.messages.create(
             model=model,
             max_tokens=max_tokens,
             system=system,
             tools=tools,
             messages=messages,
+            stream=stream,
         )
 
     def extract_content(self, response: Any) -> tuple[list[str], list[dict]]:
-        text_blocks = [b.text for b in response.content if b.type == "text"]
-        tool_uses = [
-            {"id": b.id, "name": b.name, "input": b.input}
-            for b in response.content if b.type == "tool_use"
-        ]
-        return text_blocks, tool_uses
+        if hasattr(response, '__iter__') and not isinstance(response, (str, bytes, dict)):
+            # Streaming response - collect all
+            text_parts = []
+            tool_uses = []
+            for chunk in response:
+                if chunk.type == "content_block_delta" and chunk.delta.type == "text_delta":
+                    text_parts.append(chunk.delta.text)
+                elif chunk.type == "content_block_start" and chunk.content_block.type == "tool_use":
+                    tool_uses.append({
+                        "id": chunk.content_block.id,
+                        "name": chunk.content_block.name,
+                        "input": chunk.content_block.input,
+                    })
+            return ["".join(text_parts)], tool_uses
+        else:
+            text_blocks = [b.text for b in response.content if b.type == "text"]
+            tool_uses = [
+                {"id": b.id, "name": b.name, "input": b.input}
+                for b in response.content if b.type == "tool_use"
+            ]
+            return text_blocks, tool_uses
 
     def format_tool_results(self, tool_results: list[dict]) -> list[dict]:
-        return tool_results  # Anthropic format natively matches
+        return tool_results
+
+    def stream_response(self, response: Any) -> Generator[str, None, None]:
+        for chunk in response:
+            if chunk.type == "content_block_delta" and chunk.delta.type == "text_delta":
+                yield chunk.delta.text
 
 
 class OpenAICompatibleClient(LLMClient):
-    """Client pour OpenAI, Mistral, Groq, Ollama, et endpoints compatibles."""
-
     def __init__(self, api_key: str, base_url: str | None = None):
         from openai import OpenAI
         self.client = OpenAI(api_key=api_key, base_url=base_url)
 
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type(Exception),
+    ) if HAS_TENACITY else lambda f: f
     def create_message(self, model: str, max_tokens: int, system: str,
-                       tools: list[dict], messages: list[dict]) -> Any:
-        # Convertir le format messages pour OpenAI
+                       tools: list[dict], messages: list[dict], stream: bool = False) -> Any:
         openai_messages = []
         if system:
             openai_messages.append({"role": "system", "content": system})
         openai_messages.extend(messages)
 
-        # Convertir tools au format OpenAI
         openai_tools = []
         for t in tools:
             openai_tools.append({
@@ -603,24 +761,49 @@ class OpenAICompatibleClient(LLMClient):
             messages=openai_messages,
             tools=openai_tools if openai_tools else None,
             tool_choice="auto" if openai_tools else None,
+            stream=stream,
         )
 
     def extract_content(self, response: Any) -> tuple[list[str], list[dict]]:
-        choice = response.choices[0]
-        msg = choice.message
-        text_blocks = [msg.content] if msg.content else []
-        tool_uses = []
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                tool_uses.append({
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "input": json.loads(tc.function.arguments),
-                })
-        return text_blocks, tool_uses
+        if hasattr(response, '__iter__') and not isinstance(response, (str, bytes, dict)):
+            # Streaming - collect
+            text_parts = []
+            tool_uses = []
+            current_tool = None
+            for chunk in response:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    text_parts.append(delta.content)
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        if tc.index is not None and (current_tool is None or tc.index != current_tool.get("index")):
+                            if current_tool:
+                                tool_uses.append(current_tool)
+                            current_tool = {"index": tc.index, "id": tc.id, "name": tc.function.name, "args": ""}
+                        if current_tool and tc.function.arguments:
+                            current_tool["args"] += tc.function.arguments
+            if current_tool:
+                try:
+                    current_tool["input"] = json.loads(current_tool["args"])
+                    tool_uses.append({"id": current_tool["id"], "name": current_tool["name"], "input": current_tool["input"]})
+                except json.JSONDecodeError:
+                    pass
+            return ["".join(text_parts)], tool_uses
+        else:
+            choice = response.choices[0]
+            msg = choice.message
+            text_blocks = [msg.content] if msg.content else []
+            tool_uses = []
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_uses.append({
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": json.loads(tc.function.arguments),
+                    })
+            return text_blocks, tool_uses
 
     def format_tool_results(self, tool_results: list[dict]) -> list[dict]:
-        # Format OpenAI pour tool results
         formatted = []
         for tr in tool_results:
             formatted.append({
@@ -630,20 +813,28 @@ class OpenAICompatibleClient(LLMClient):
             })
         return formatted
 
+    def stream_response(self, response: Any) -> Generator[str, None, None]:
+        for chunk in response:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+
 
 class GoogleClient(LLMClient):
-    """Client pour Google Gemini (avec function calling)."""
-
     def __init__(self, api_key: str, base_url: str | None = None):
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         self.genai = genai
-        self.model_name = None  # sera défini à l'appel
+        self.model_name = None
 
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type(Exception),
+    ) if HAS_TENACITY else lambda f: f
     def create_message(self, model: str, max_tokens: int, system: str,
-                       tools: list[dict], messages: list[dict]) -> Any:
+                       tools: list[dict], messages: list[dict], stream: bool = False) -> Any:
         self.model_name = model
-        # Convertir tools au format Gemini
         gemini_tools = []
         for t in tools:
             gemini_tools.append({
@@ -654,19 +845,17 @@ class GoogleClient(LLMClient):
                 }]
             })
 
-        model = self.genai.GenerativeModel(
+        model_obj = self.genai.GenerativeModel(
             model_name=model,
             tools=gemini_tools if gemini_tools else None,
             system_instruction=system if system else None,
         )
 
-        # Convertir messages
         gemini_messages = []
         for m in messages:
             role = "user" if m["role"] == "user" else "model"
             content = m["content"]
             if isinstance(content, list):
-                # Gérer les tool_results
                 parts = []
                 for item in content:
                     if item.get("type") == "tool_result":
@@ -682,26 +871,42 @@ class GoogleClient(LLMClient):
             else:
                 gemini_messages.append({"role": role, "parts": [{"text": str(content)}]})
 
-        chat = model.start_chat(history=gemini_messages[:-1])
-        return chat.send_message(gemini_messages[-1]["parts"])
+        chat = model_obj.start_chat(history=gemini_messages[:-1])
+        return chat.send_message(gemini_messages[-1]["parts"], stream=stream)
 
     def extract_content(self, response: Any) -> tuple[list[str], list[dict]]:
-        text_blocks = []
-        tool_uses = []
-        for part in response.parts:
-            if part.text:
-                text_blocks.append(part.text)
-            if part.function_call:
-                fc = part.function_call
-                tool_uses.append({
-                    "id": fc.id or "call_" + secrets.token_hex(8),
-                    "name": fc.name,
-                    "input": dict(fc.args),
-                })
-        return text_blocks, tool_uses
+        if hasattr(response, '__iter__') and not isinstance(response, (str, bytes, dict)):
+            # Streaming not well supported for function calling in Gemini
+            text_parts = []
+            tool_uses = []
+            for chunk in response:
+                for part in chunk.parts:
+                    if part.text:
+                        text_parts.append(part.text)
+                    if part.function_call:
+                        fc = part.function_call
+                        tool_uses.append({
+                            "id": fc.id or "call_" + secrets.token_hex(8),
+                            "name": fc.name,
+                            "input": dict(fc.args),
+                        })
+            return ["".join(text_parts)], tool_uses
+        else:
+            text_blocks = []
+            tool_uses = []
+            for part in response.parts:
+                if part.text:
+                    text_blocks.append(part.text)
+                if part.function_call:
+                    fc = part.function_call
+                    tool_uses.append({
+                        "id": fc.id or "call_" + secrets.token_hex(8),
+                        "name": fc.name,
+                        "input": dict(fc.args),
+                    })
+            return text_blocks, tool_uses
 
     def format_tool_results(self, tool_results: list[dict]) -> list[dict]:
-        # Pour Gemini, on renvoie dans le prochain message utilisateur
         parts = []
         for tr in tool_results:
             parts.append({
@@ -712,9 +917,14 @@ class GoogleClient(LLMClient):
             })
         return [{"role": "user", "parts": parts}]
 
+    def stream_response(self, response: Any) -> Generator[str, None, None]:
+        for chunk in response:
+            for part in chunk.parts:
+                if part.text:
+                    yield part.text
+
 
 def create_llm_client(provider: str, api_key: str, base_url: str | None) -> LLMClient:
-    """Factory pour créer le client approprié selon le fournisseur."""
     provider = provider.lower()
     if provider == "anthropic":
         return AnthropicClient(api_key, base_url)
@@ -723,12 +933,38 @@ def create_llm_client(provider: str, api_key: str, base_url: str | None) -> LLMC
     elif provider == "google":
         return GoogleClient(api_key, base_url)
     else:
-        # Par défaut, essayer OpenAI-compatible
         return OpenAICompatibleClient(api_key, base_url)
 
 
-_lock = threading.Lock()
-_state: dict = {"messages": []}
+# =============================================================================
+# PROCESS MESSAGE AVEC STREAMING ET PERSISTANCE
+# =============================================================================
+
+class SessionManager:
+    def __init__(self):
+        self.sessions: dict[str, list[dict]] = {}
+        self.lock = threading.Lock()
+
+    def get_or_create(self, session_id: str) -> list[dict]:
+        with self.lock:
+            if session_id not in self.sessions:
+                # Charger depuis DB
+                self.sessions[session_id] = load_session(session_id)
+            return self.sessions[session_id]
+
+    def save(self, session_id: str) -> None:
+        with self.lock:
+            messages = self.sessions.get(session_id, [])
+            # On ne sauvegarde que les nouveaux messages (pas de sync complet pour simplicité)
+            # En production, faire un diff
+
+    def clear(self, session_id: str) -> None:
+        with self.lock:
+            self.sessions.pop(session_id, None)
+            delete_session(session_id)
+
+
+session_mgr = SessionManager()
 
 
 def run_tool(name: str, tool_input: dict) -> str:
@@ -755,18 +991,20 @@ def run_tool(name: str, tool_input: dict) -> str:
 
         return json.dumps({"erreur": f"Outil inconnu : {name}"})
 
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
+        log.exception("Erreur outil %s", name)
         return json.dumps({"erreur": str(exc)}, ensure_ascii=False)
 
 
-def process_message(user_text: str) -> tuple[str, list[dict]]:
-    """Envoie le message au LLM configuré, exécute les outils demandés, et renvoie la réponse finale."""
+def process_message(session_id: str, user_text: str, stream: bool = False) -> tuple[str, list[dict]] | Generator[str, None, tuple[str, list[dict]]]:
+    """Traite un message. Si stream=True, retourne un générateur qui yield les tokens."""
     api_key, base_url, model = resolve_config()
     provider = get_active_provider()
     client = create_llm_client(NOVA_PROVIDER, api_key, base_url)
 
-    messages = _state["messages"]
+    messages = session_mgr.get_or_create(session_id)
     messages.append({"role": "user", "content": user_text})
+    save_message(session_id, "user", user_text)
 
     tool_log: list[dict] = []
     final_text_parts: list[str] = []
@@ -774,44 +1012,57 @@ def process_message(user_text: str) -> tuple[str, list[dict]]:
     while True:
         response = client.create_message(
             model=model,
-            max_tokens=1500,
+            max_tokens=2000,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,
+            stream=stream,
         )
 
-        # Normaliser la réponse pour l'historique
-        text_blocks, tool_uses = client.extract_content(response)
-
-        # Stocker la réponse de l'assistant
-        if NOVA_PROVIDER == "google":
-            # Format Gemini
-            assistant_content = []
-            for t in text_blocks:
-                assistant_content.append({"type": "text", "text": t})
-            for tu in tool_uses:
-                assistant_content.append({
-                    "type": "function_call",
-                    "id": tu["id"],
-                    "name": tu["name"],
-                    "args": tu["input"],
-                })
-            messages.append({"role": "model", "content": assistant_content})
+        if stream:
+            # Streaming: yield tokens, then continue loop when done
+            text_chunks = []
+            tool_uses = []
+            for chunk in response:
+                if hasattr(chunk, 'type'):  # Anthropic
+                    if chunk.type == "content_block_delta" and chunk.delta.type == "text_delta":
+                        text_chunks.append(chunk.delta.text)
+                        yield chunk.delta.text
+                    elif chunk.type == "content_block_start" and chunk.content_block.type == "tool_use":
+                        tool_uses.append({
+                            "id": chunk.content_block.id,
+                            "name": chunk.content_block.name,
+                            "input": chunk.content_block.input,
+                        })
+                else:  # OpenAI compatible
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        text_chunks.append(delta.content)
+                        yield delta.content
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            # Collect tool calls (simplifié)
+                            pass
+            text = "".join(text_chunks)
+            final_text_parts.append(text)
         else:
-            # Format Anthropic / OpenAI
-            assistant_content = []
-            for t in text_blocks:
-                assistant_content.append({"type": "text", "text": t})
-            for tu in tool_uses:
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": tu["id"],
-                    "name": tu["name"],
-                    "input": tu["input"],
-                })
-            messages.append({"role": "assistant", "content": assistant_content})
+            text_blocks, tool_uses = client.extract_content(response)
+            text = "\n\n".join(text_blocks)
+            final_text_parts.append(text)
 
-        final_text_parts.extend(text_blocks)
+        # Sauvegarder réponse assistant
+        assistant_content = []
+        for t in (text_blocks if not stream else [text]):
+            assistant_content.append({"type": "text", "text": t})
+        for tu in tool_uses:
+            assistant_content.append({
+                "type": "tool_use",
+                "id": tu["id"],
+                "name": tu["name"],
+                "input": tu["input"],
+            })
+        messages.append({"role": "assistant", "content": assistant_content})
+        save_message(session_id, "assistant", text, tool_calls=tool_uses)
 
         if not tool_uses:
             break
@@ -836,28 +1087,34 @@ def process_message(user_text: str) -> tuple[str, list[dict]]:
                     "content": result,
                 })
             else:
-                # OpenAI compatible
                 tool_results.append({
                     "tool_use_id": call["id"],
                     "name": call["name"],
                     "content": result,
                 })
 
-        # Ajouter les résultats d'outils
         formatted_results = client.format_tool_results(tool_results)
         if NOVA_PROVIDER == "google":
-            # Gemini attend un message utilisateur avec function_response
             messages.extend(formatted_results)
         else:
             messages.append({"role": "user", "content": formatted_results})
+        save_message(session_id, "tool", "", tool_results=tool_results)
 
-    return "\n\n".join(final_text_parts).strip(), tool_log
+    final_response = "\n\n".join(final_text_parts).strip()
+    
+    if stream:
+        # Retourner le générateur qui a déjà yield les tokens
+        def gen():
+            yield from []  # Already yielded
+            return final_response, tool_log
+        return gen()
+    
+    return final_response, tool_log
 
 
 # =============================================================================
-# PARTIE 3 : INTERFACE WEB (page de chat embarquée + serveur Flask)
+# PARTIE 3 : INTERFACE WEB (Flask + SSE pour streaming)
 # =============================================================================
-
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -895,7 +1152,7 @@ p.sub{color:var(--dim);max-width:620px}
 .msg .who{font:10px var(--m);letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:4px;display:block}
 .msg.user .who{color:var(--a)}
 .msg p{white-space:pre-wrap}
-.msg.pending{color:var(--dim);font-style:italic}
+.msg.streaming{cursor:wait}
 .toolline{font:11px var(--m);color:var(--b);border-left:2px solid var(--b);padding:2px 8px;margin-top:6px}
 
 #inputBar{position:fixed;left:0;right:0;bottom:0;background:rgba(244,247,251,.95);backdrop-filter:blur(8px);border-top:1px solid var(--ink);padding:12px 16px;z-index:30}
@@ -912,12 +1169,21 @@ textarea:focus{border-color:var(--a);background:#fff}
 #lb{flex:1;overflow:auto;padding:8px 10px;font:11px/1.5 var(--m)}
 .lg{border-bottom:1px dashed #26405c;padding:4px 0}
 .lg b{color:#7dffb5}
+.lg.err{color:#ff6b6b}
 
 .provider-badge{font:10px var(--m);padding:2px 8px;border:1px solid var(--dim);color:var(--dim);border-radius:3px;margin-left:8px}
 
+.session-list{position:fixed;left:16px;bottom:78px;width:300px;max-height:40vh;background:#fff;border:1px solid var(--ln);z-index:40;display:none;flex-direction:column}
+.session-list.on{display:flex}
+.session-list .hd{padding:8px 12px;border-bottom:1px solid var(--ln);font:600 12px var(--m);display:flex;justify-content:space-between}
+.session-list ul{list-style:none;padding:8px;overflow:auto}
+.session-list li{padding:8px 12px;border-bottom:1px solid var(--ln);cursor:pointer;font:12px var(--m)}
+.session-list li:hover{background:#f0f4f8}
+.session-list li .meta{font-size:10px;color:var(--dim);margin-top:2px}
+
 @media(max-width:700px){
   .msg{max-width:92%}
-  #con{right:8px;left:8px;width:auto}
+  #con,#session-list{right:8px;left:8px;width:auto}
 }
 </style></head><body>
 
@@ -926,6 +1192,7 @@ textarea:focus{border-color:var(--a);background:#fff}
   <div class="hb">
     <span class="chip" id="statusChip">Vérification…</span>
     <span class="provider-badge" id="providerBadge">Provider: —</span>
+    <button class="sm" id="toggleSessions">Sessions</button>
     <button class="sm" id="toggleConsole">Journal</button>
     <button class="sm" id="resetBtn">Nouvelle session</button>
   </div>
@@ -935,9 +1202,8 @@ textarea:focus{border-color:var(--a);background:#fff}
   <div class="hero">
     <div class="lab">Assistant conversationnel</div>
     <h2>Parle à ton <b>Agent IA</b></h2>
-    <p class="sub">Demande-lui d'analyser un fichier Python, d'auditer un dossier de code, ou de créer un squelette de nouveau projet. Il s'exécute entièrement en local.</p>
+    <p class="sub">Demande-lui d'analyser un fichier Python, d'auditer un dossier de code, ou de créer un squelette de nouveau projet. Streaming activé.</p>
   </div>
-
   <div id="thread"></div>
 </main>
 
@@ -953,6 +1219,11 @@ textarea:focus{border-color:var(--a);background:#fff}
   <div id="lb"></div>
 </div>
 
+<div id="sessionList" class="session-list">
+  <div class="hd"><span>SESSIONS RÉCENTES</span><button id="closeSessions">✕</button></div>
+  <ul id="sessionItems"></ul>
+</div>
+
 <script>
 const thread = document.getElementById('thread');
 const input = document.getElementById('input');
@@ -961,6 +1232,12 @@ const statusChip = document.getElementById('statusChip');
 const providerBadge = document.getElementById('providerBadge');
 const con = document.getElementById('con');
 const lb = document.getElementById('lb');
+const sessionList = document.getElementById('sessionList');
+const sessionItems = document.getElementById('sessionItems');
+
+let currentSessionId = crypto.randomUUID();
+let currentMsgDiv = null;
+let abortController = null;
 
 function addMsg(who, text, pending=false){
   const d = document.createElement('div');
@@ -972,9 +1249,9 @@ function addMsg(who, text, pending=false){
   return d;
 }
 
-function logLine(text){
+function logLine(text, isError=false){
   const l = document.createElement('div');
-  l.className = 'lg';
+  l.className = 'lg' + (isError ? ' err' : '');
   l.innerHTML = text;
   lb.appendChild(l);
   lb.scrollTop = lb.scrollHeight;
@@ -993,9 +1270,47 @@ async function checkStatus(){
     }
     providerBadge.textContent = 'Provider: ' + (d.fournisseur || 'inconnu');
     if(d.modele) providerBadge.textContent += ' · ' + d.modele;
+    loadSessions();
   }catch(e){
     statusChip.textContent = 'Serveur injoignable';
     statusChip.className = 'chip off';
+  }
+}
+
+async function loadSessions(){
+  try{
+    const r = await fetch('/api/sessions');
+    const sessions = await r.json();
+    sessionItems.innerHTML = '';
+    sessions.forEach(s=>{
+      const li = document.createElement('li');
+      li.innerHTML = '<b>'+(s.title||s.id.slice(0,8))+'</b><div class="meta">'+s.provider+' · '+s.model+' · '+new Date(s.updated_at).toLocaleString()+'</div>';
+      li.onclick = ()=>switchSession(s.id);
+      sessionItems.appendChild(li);
+    });
+  }catch(e){}
+}
+
+function switchSession(id){
+  currentSessionId = id;
+  thread.innerHTML = '';
+  lb.innerHTML = '';
+  loadSessionHistory(id);
+  sessionList.classList.remove('on');
+}
+
+async function loadSessionHistory(id){
+  try{
+    const r = await fetch('/api/session/'+encodeURIComponent(id));
+    const data = await r.json();
+    data.messages.forEach(m=>{
+      if(m.role==='user') addMsg('user', m.content);
+      else if(m.role==='assistant') addMsg('agent', m.content);
+      if(m.tool_calls) m.tool_calls.forEach(t=>logLine('<b>'+t.name+'</b>('+JSON.stringify(t.input)+')'));
+    });
+    addMsg('agent', '— Session restaurée —');
+  }catch(e){
+    logLine('<b>ERREUR</b> Impossible de charger la session', true);
   }
 }
 
@@ -1004,29 +1319,56 @@ async function send(){
   if(!text) return;
   input.value = '';
   addMsg('user', text);
-  const pending = addMsg('agent', 'Réflexion…', true);
+  currentMsgDiv = addMsg('agent', '', true);
+  currentMsgDiv.classList.add('streaming');
   sendBtn.disabled = true;
+  const p = currentMsgDiv.querySelector('p');
 
+  abortController = new AbortController();
   try{
-    const r = await fetch('/api/chat', {
+    const r = await fetch('/api/chat/stream', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({message: text})
+      body: JSON.stringify({message: text, session_id: currentSessionId}),
+      signal: abortController.signal
     });
-    const d = await r.json();
-    pending.remove();
-    if(d.erreur){
-      addMsg('agent', 'Erreur : ' + d.erreur);
-      logLine('<b>ERREUR</b> ' + d.erreur);
-    } else {
-      addMsg('agent', d.reponse || '(réponse vide)');
-      (d.appels_outils||[]).forEach(t=>{
-        logLine('<b>'+t.name+'</b>('+JSON.stringify(t.input)+')');
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while(true){
+      const {done, value} = await reader.read();
+      if(done) break;
+      buffer += decoder.decode(value, {stream:true});
+      const lines = buffer.split('\\n\\n');
+      buffer = lines.pop() || '';
+      lines.forEach(line=>{
+        if(line.startsWith('data: ')){
+          const data = line.slice(6);
+          if(data === '[DONE]') return;
+          try{
+            const parsed = JSON.parse(data);
+            if(parsed.token){
+              p.textContent += parsed.token;
+              window.scrollTo(0, document.body.scrollHeight);
+            }
+            if(parsed.tool){
+              logLine('<b>'+parsed.tool.name+'</b>('+JSON.stringify(parsed.tool.input)+')');
+            }
+            if(parsed.done){
+              currentMsgDiv.classList.remove('streaming','pending');
+              p.textContent = parsed.final_text || p.textContent;
+              if(parsed.tools) parsed.tools.forEach(t=>logLine('<b>'+t.name+'</b>('+JSON.stringify(t.input)+')'));
+            }
+          }catch(e){}
+        }
       });
     }
   }catch(e){
-    pending.remove();
-    addMsg('agent', 'Erreur réseau : ' + e.message);
+    if(e.name !== 'AbortError'){
+      currentMsgDiv.classList.remove('streaming','pending');
+      p.textContent = 'Erreur réseau : ' + e.message;
+      logLine('<b>ERREUR</b> ' + e.message, true);
+    }
   }
   sendBtn.disabled = false;
   input.focus();
@@ -1037,13 +1379,16 @@ input.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }
 });
 document.getElementById('resetBtn').addEventListener('click', async ()=>{
-  await fetch('/api/reset', {method:'POST'});
+  if(abortController) abortController.abort();
+  currentSessionId = crypto.randomUUID();
   thread.innerHTML = '';
   lb.innerHTML = '';
   addMsg('agent', 'Nouvelle session démarrée. Comment puis-je t\'aider ?');
 });
 document.getElementById('toggleConsole').addEventListener('click', ()=>con.classList.add('on'));
 document.getElementById('closeConsole').addEventListener('click', ()=>con.classList.remove('on'));
+document.getElementById('toggleSessions').addEventListener('click', ()=>sessionList.classList.add('on'));
+document.getElementById('closeSessions').addEventListener('click', ()=>sessionList.classList.remove('on'));
 
 checkStatus();
 addMsg('agent', 'Bonjour ! Je suis ton Agent IA NOVA. Demande-moi d\'analyser un fichier, d\'auditer un dossier, ou de créer un nouveau projet.');
@@ -1053,7 +1398,7 @@ addMsg('agent', 'Bonjour ! Je suis ton Agent IA NOVA. Demande-moi d\'analyser un
 
 
 def _build_flask_app():
-    from flask import Flask, Response, jsonify, request
+    from flask import Flask, Response, jsonify, request, stream_with_context
 
     app = Flask(__name__)
 
@@ -1067,13 +1412,13 @@ def _build_flask_app():
         api_key_present = False
         client_ok = False
         model = ""
+        base_url = None
         try:
             api_key, base_url, model = resolve_config()
             api_key_present = bool(api_key)
             client_ok = True
-        except RuntimeError:
-            pass
-
+        except RuntimeError as e:
+            log.warning("Config error: %s", e)
         return jsonify({
             "fournisseur": provider.name,
             "provider_key": NOVA_PROVIDER,
@@ -1081,27 +1426,160 @@ def _build_flask_app():
             "base_url": base_url,
             "cle_api_presente": api_key_present,
             "client_ok": client_ok,
-            "messages_en_memoire": len(_state["messages"]),
             "fournisseurs_disponibles": list(PROVIDERS.keys()),
+            "streaming_supporte": provider.supports_streaming,
         })
+
+    @app.route("/api/sessions")
+    def api_sessions():
+        return jsonify(list_sessions(20))
+
+    @app.route("/api/session/<session_id>")
+    def api_session(session_id: str):
+        messages = load_session(session_id)
+        return jsonify({"session_id": session_id, "messages": messages})
 
     @app.route("/api/chat", methods=["POST"])
     def api_chat():
         data = request.get_json(force=True, silent=True) or {}
         text = (data.get("message") or "").strip()
+        session_id = data.get("session_id") or secrets.token_urlsafe(16)
         if not text:
             return jsonify({"erreur": "Message vide."}), 400
-        with _lock:
+        try:
+            reply, tool_log = process_message(session_id, text, stream=False)
+        except Exception as exc:
+            log.exception("Chat error")
+            return jsonify({"erreur": str(exc)}), 500
+        return jsonify({"reponse": reply, "appels_outils": tool_log, "session_id": session_id})
+
+    @app.route("/api/chat/stream", methods=["POST"])
+    def api_chat_stream():
+        data = request.get_json(force=True, silent=True) or {}
+        text = (data.get("message") or "").strip()
+        session_id = data.get("session_id") or secrets.token_urlsafe(16)
+        if not text:
+            return jsonify({"erreur": "Message vide."}), 400
+
+        def generate():
             try:
-                reply, tool_log = process_message(text)
-            except Exception as exc:  # noqa: BLE001
-                return jsonify({"erreur": str(exc)}), 500
-        return jsonify({"reponse": reply, "appels_outils": tool_log})
+                # Send initial event
+                yield f"data: {json.dumps({'token': ''})}\n\n"
+                
+                full_text = ""
+                all_tools = []
+                
+                # Process with streaming
+                api_key, base_url, model = resolve_config()
+                provider = get_active_provider()
+                client = create_llm_client(NOVA_PROVIDER, api_key, base_url)
+                
+                messages = session_mgr.get_or_create(session_id)
+                messages.append({"role": "user", "content": text})
+                save_message(session_id, "user", text)
+
+                while True:
+                    response = client.create_message(
+                        model=model,
+                        max_tokens=2000,
+                        system=SYSTEM_PROMPT,
+                        tools=TOOLS,
+                        messages=messages,
+                        stream=True,
+                    )
+
+                    text_chunks = []
+                    tool_uses = []
+                    
+                    for chunk in response:
+                        if NOVA_PROVIDER == "anthropic":
+                            if chunk.type == "content_block_delta" and chunk.delta.type == "text_delta":
+                                text_chunks.append(chunk.delta.text)
+                                yield f"data: {json.dumps({'token': chunk.delta.text})}\n\n"
+                            elif chunk.type == "content_block_start" and chunk.content_block.type == "tool_use":
+                                tool_uses.append({
+                                    "id": chunk.content_block.id,
+                                    "name": chunk.content_block.name,
+                                    "input": chunk.content_block.input,
+                                })
+                                yield f"data: {json.dumps({'tool': {'name': chunk.content_block.name, 'input': chunk.content_block.input}})}\n\n"
+                        else:
+                            delta = chunk.choices[0].delta
+                            if delta.content:
+                                text_chunks.append(delta.content)
+                                yield f"data: {json.dumps({'token': delta.content})}\n\n"
+                            if delta.tool_calls:
+                                for tc in delta.tool_calls:
+                                    # Simplifié pour streaming
+                                    pass
+
+                    text = "".join(text_chunks)
+                    full_text += text
+
+                    # Save assistant message
+                    assistant_content = [{"type": "text", "text": text}]
+                    for tu in tool_uses:
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": tu["id"],
+                            "name": tu["name"],
+                            "input": tu["input"],
+                        })
+                    messages.append({"role": "assistant", "content": assistant_content})
+                    save_message(session_id, "assistant", text, tool_calls=tool_uses)
+
+                    if not tool_uses:
+                        break
+
+                    # Execute tools
+                    tool_results = []
+                    for call in tool_uses:
+                        result = run_tool(call["name"], call["input"])
+                        all_tools.append({"name": call["name"], "input": call["input"], "result": result})
+
+                        if NOVA_PROVIDER == "anthropic":
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": call["id"],
+                                "content": result,
+                            })
+                        elif NOVA_PROVIDER == "google":
+                            tool_results.append({
+                                "type": "tool_result",
+                                "name": call["name"],
+                                "tool_use_id": call["id"],
+                                "content": result,
+                            })
+                        else:
+                            tool_results.append({
+                                "tool_use_id": call["id"],
+                                "name": call["name"],
+                                "content": result,
+                            })
+
+                    formatted_results = client.format_tool_results(tool_results)
+                    if NOVA_PROVIDER == "google":
+                        messages.extend(formatted_results)
+                    else:
+                        messages.append({"role": "user", "content": formatted_results})
+                    save_message(session_id, "tool", "", tool_results=tool_results)
+
+                yield f"data: {json.dumps({'done': True, 'final_text': full_text, 'tools': all_tools})}\n\n"
+                yield "data: [DONE]\n\n"
+
+            except Exception as exc:
+                log.exception("Stream error")
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                yield "data: [DONE]\n\n"
+
+        return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
     @app.route("/api/reset", methods=["POST"])
     def api_reset():
-        with _lock:
-            _state["messages"] = []
+        data = request.get_json(force=True, silent=True) or {}
+        session_id = data.get("session_id")
+        if session_id:
+            session_mgr.clear(session_id)
         return jsonify({"statut": "ok"})
 
     return app
@@ -1114,17 +1592,19 @@ def run_web(host: str = "127.0.0.1", port: int = 5000) -> None:
         print("Dépendance manquante. Installe-la avec : pip install flask")
         sys.exit(1)
     provider = get_active_provider()
+    init_db()
     print(f"Agent IA NOVA — interface web sur http://{host}:{port}")
     print(f"Fournisseur: {provider.name} ({NOVA_PROVIDER})")
     api_key, base_url, model = resolve_config()
     print(f"Modèle: {model}")
     if base_url:
         print(f"Base URL: {base_url}")
-    app.run(host=host, port=port, debug=False)
+    print(f"Base de données: {DB_PATH}")
+    app.run(host=host, port=port, debug=False, threaded=True)
 
 
 # =============================================================================
-# CLI (mode ligne de commande, hérité de Nova Safe Core)
+# CLI
 # =============================================================================
 
 def ask_password(confirm: bool = False) -> str:
@@ -1161,6 +1641,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="URL de base de l'API (pour endpoints compatibles OpenAI)"
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Niveau de log"
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -1189,6 +1675,10 @@ def build_parser() -> argparse.ArgumentParser:
     project = sub.add_parser("new-project", help="Créer un squelette de projet complet.")
     project.add_argument("destination", type=Path)
     project.add_argument("--name", type=str, default=None)
+
+    sessions = sub.add_parser("sessions", help="Gérer les sessions.")
+    sessions.add_argument("action", choices=["list", "delete"], nargs="?", default="list")
+    sessions.add_argument("session_id", nargs="?")
 
     return parser
 
@@ -1219,7 +1709,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    # Appliquer les arguments CLI pour surcharger la config
+    # Setup logging
+    global log
+    log = setup_logging(args.log_level)
+
+    # Apply CLI overrides
     if args.provider:
         os.environ["NOVA_API_PROVIDER"] = args.provider
     if args.model:
@@ -1275,8 +1769,23 @@ def main() -> int:
             path = create_project(args.destination, name=args.name)
             print(f"Projet créé dans : {path}")
 
+        elif command == "sessions":
+            if args.action == "list":
+                sessions = list_sessions()
+                if not sessions:
+                    print("Aucune session.")
+                else:
+                    for s in sessions:
+                        print(f"{s['id']} | {s['provider']} | {s['model']} | {s['updated_at']} | {s.get('title','')}")
+            elif args.action == "delete" and args.session_id:
+                delete_session(args.session_id)
+                print(f"Session {args.session_id} supprimée.")
+            else:
+                print("Usage: sessions list|delete <id>")
+
         return 0
     except (OSError, ValueError, RuntimeError, NotADirectoryError) as exc:
+        log.error("Erreur: %s", exc)
         print(f"Erreur : {exc}", file=sys.stderr)
         return 1
 
