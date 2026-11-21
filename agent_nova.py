@@ -765,23 +765,34 @@ class OpenAICompatibleClient(LLMClient):
         )
 
     def extract_content(self, response: Any) -> tuple[list[str], list[dict]]:
-        if hasattr(response, '__iter__') and not isinstance(response, (str, bytes, dict)):
+        # Streaming response is a generator/iterator of ChatCompletionChunk
+        # Non-streaming is a ChatCompletion object (has .choices but not __iter__ in a streaming sense)
+        # Check if it's a streaming response by looking for the chunk structure
+        from openai.types.chat import ChatCompletionChunk
+        is_streaming = (
+            hasattr(response, '__iter__') 
+            and not isinstance(response, (str, bytes, dict))
+            and not hasattr(response, 'choices')  # ChatCompletion has .choices, chunks don't
+        )
+        # More robust: check if first element would be a ChatCompletionChunk
+        if is_streaming:
             # Streaming - collect
             text_parts = []
             tool_uses = []
             current_tool = None
             for chunk in response:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    text_parts.append(delta.content)
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        if tc.index is not None and (current_tool is None or tc.index != current_tool.get("index")):
-                            if current_tool:
-                                tool_uses.append(current_tool)
-                            current_tool = {"index": tc.index, "id": tc.id, "name": tc.function.name, "args": ""}
-                        if current_tool and tc.function.arguments:
-                            current_tool["args"] += tc.function.arguments
+                if isinstance(chunk, ChatCompletionChunk) and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        text_parts.append(delta.content)
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            if tc.index is not None and (current_tool is None or tc.index != current_tool.get("index")):
+                                if current_tool:
+                                    tool_uses.append(current_tool)
+                                current_tool = {"index": tc.index, "id": tc.id, "name": tc.function.name, "args": ""}
+                            if current_tool and tc.function.arguments:
+                                current_tool["args"] += tc.function.arguments
             if current_tool:
                 try:
                     current_tool["input"] = json.loads(current_tool["args"])
@@ -790,6 +801,7 @@ class OpenAICompatibleClient(LLMClient):
                     pass
             return ["".join(text_parts)], tool_uses
         else:
+            # Non-streaming ChatCompletion
             choice = response.choices[0]
             msg = choice.message
             text_blocks = [msg.content] if msg.content else []
@@ -996,7 +1008,7 @@ def run_tool(name: str, tool_input: dict) -> str:
         return json.dumps({"erreur": str(exc)}, ensure_ascii=False)
 
 
-def process_message(session_id: str, user_text: str, stream: bool = False) -> tuple[str, list[dict]] | Generator[str, None, tuple[str, list[dict]]]:
+def process_message(session_id: str, user_text: str, stream: bool = False):
     """Traite un message. Si stream=True, retourne un générateur qui yield les tokens."""
     api_key, base_url, model = resolve_config()
     provider = get_active_provider()
@@ -1009,6 +1021,9 @@ def process_message(session_id: str, user_text: str, stream: bool = False) -> tu
     tool_log: list[dict] = []
     final_text_parts: list[str] = []
 
+    if stream:
+        return _process_message_stream(client, messages, tool_log, final_text_parts, session_id, model)
+
     while True:
         response = client.create_message(
             model=model,
@@ -1016,43 +1031,16 @@ def process_message(session_id: str, user_text: str, stream: bool = False) -> tu
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,
-            stream=stream,
+            stream=False,
         )
 
-        if stream:
-            # Streaming: yield tokens, then continue loop when done
-            text_chunks = []
-            tool_uses = []
-            for chunk in response:
-                if hasattr(chunk, 'type'):  # Anthropic
-                    if chunk.type == "content_block_delta" and chunk.delta.type == "text_delta":
-                        text_chunks.append(chunk.delta.text)
-                        yield chunk.delta.text
-                    elif chunk.type == "content_block_start" and chunk.content_block.type == "tool_use":
-                        tool_uses.append({
-                            "id": chunk.content_block.id,
-                            "name": chunk.content_block.name,
-                            "input": chunk.content_block.input,
-                        })
-                else:  # OpenAI compatible
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        text_chunks.append(delta.content)
-                        yield delta.content
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            # Collect tool calls (simplifié)
-                            pass
-            text = "".join(text_chunks)
-            final_text_parts.append(text)
-        else:
-            text_blocks, tool_uses = client.extract_content(response)
-            text = "\n\n".join(text_blocks)
-            final_text_parts.append(text)
+        text_blocks, tool_uses = client.extract_content(response)
+        text = "\n\n".join(text_blocks)
+        final_text_parts.append(text)
 
         # Sauvegarder réponse assistant
         assistant_content = []
-        for t in (text_blocks if not stream else [text]):
+        for t in text_blocks:
             assistant_content.append({"type": "text", "text": t})
         for tu in tool_uses:
             assistant_content.append({
@@ -1094,21 +1082,98 @@ def process_message(session_id: str, user_text: str, stream: bool = False) -> tu
                 })
 
         formatted_results = client.format_tool_results(tool_results)
-        if NOVA_PROVIDER == "google":
-            messages.extend(formatted_results)
-        else:
-            messages.append({"role": "user", "content": formatted_results})
+        # Pour OpenAI-compatible et Anthropic : ajouter les résultats d'outils comme messages séparés
+        messages.extend(formatted_results)
         save_message(session_id, "tool", "", tool_results=tool_results)
 
     final_response = "\n\n".join(final_text_parts).strip()
-    
-    if stream:
-        # Retourner le générateur qui a déjà yield les tokens
-        def gen():
-            yield from []  # Already yielded
-            return final_response, tool_log
-        return gen()
-    
+    return final_response, tool_log
+
+
+def _process_message_stream(client: LLMClient, messages: list, tool_log: list, final_text_parts: list, session_id: str, model: str):
+    """Générateur pour le streaming - fonction séparée pour éviter le problème de yield."""
+    while True:
+        response = client.create_message(
+            model=model,
+            max_tokens=2000,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+            stream=True,
+        )
+
+        text_chunks = []
+        tool_uses = []
+        for chunk in response:
+            if hasattr(chunk, 'type'):  # Anthropic
+                if chunk.type == "content_block_delta" and chunk.delta.type == "text_delta":
+                    text_chunks.append(chunk.delta.text)
+                    yield chunk.delta.text
+                elif chunk.type == "content_block_start" and chunk.content_block.type == "tool_use":
+                    tool_uses.append({
+                        "id": chunk.content_block.id,
+                        "name": chunk.content_block.name,
+                        "input": chunk.content_block.input,
+                    })
+            else:  # OpenAI compatible
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    text_chunks.append(delta.content)
+                    yield delta.content
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        pass  # Simplifié
+
+        text = "".join(text_chunks)
+        final_text_parts.append(text)
+
+        # Sauvegarder réponse assistant
+        assistant_content = [{"type": "text", "text": text}]
+        for tu in tool_uses:
+            assistant_content.append({
+                "type": "tool_use",
+                "id": tu["id"],
+                "name": tu["name"],
+                "input": tu["input"],
+            })
+        messages.append({"role": "assistant", "content": assistant_content})
+        save_message(session_id, "assistant", text, tool_calls=tool_uses)
+
+        if not tool_uses:
+            break
+
+        # Exécuter les outils
+        tool_results = []
+        for call in tool_uses:
+            result = run_tool(call["name"], call["input"])
+            tool_log.append({"name": call["name"], "input": call["input"], "result": result})
+
+            if NOVA_PROVIDER == "anthropic":
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": call["id"],
+                    "content": result,
+                })
+            elif NOVA_PROVIDER == "google":
+                tool_results.append({
+                    "type": "tool_result",
+                    "name": call["name"],
+                    "tool_use_id": call["id"],
+                    "content": result,
+                })
+            else:
+                tool_results.append({
+                    "tool_use_id": call["id"],
+                    "name": call["name"],
+                    "content": result,
+                })
+
+        formatted_results = client.format_tool_results(tool_results)
+        # Pour OpenAI-compatible et Anthropic : ajouter les résultats d'outils comme messages séparés
+        messages.extend(formatted_results)
+        save_message(session_id, "tool", "", tool_results=tool_results)
+
+    final_response = "\n\n".join(final_text_parts).strip()
     return final_response, tool_log
 
 
